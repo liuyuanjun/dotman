@@ -1,0 +1,905 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# dotman - 自用 dotfiles 管理脚本
+# 模型：真实文件保存在 Git 仓库，本机通过软链引用仓库中的文件/目录。
+
+VERSION="0.2.0"
+
+# ---------- 全局默认配置 ----------
+readonly DOTMAN_HOME="${DOTMAN_HOME:-${HOME}/.dotman}"
+readonly DOTMAN_REPO="${DOTMAN_REPO:-${DOTMAN_HOME}/dotfiles}"
+readonly DOTMAN_CONFIG_DIR="${HOME}/.config/dotman"
+readonly CONFIG_FILE="config.toml"
+readonly LINKS_COMMON="links.common.toml"
+readonly LINKS_PREFIX="links."
+readonly DATE_FMT=".%Y%m%d%H%M%S.bak"
+
+# ---------- 颜色 ----------
+readonly C_RED=$'\033[31m'
+readonly C_GREEN=$'\033[32m'
+readonly C_YELLOW=$'\033[33m'
+readonly C_CYAN=$'\033[36m'
+readonly C_BLUE=$'\033[34m'
+readonly C_BOLD=$'\033[1m'
+readonly C_RESET=$'\033[0m'
+
+err()  { echo "${C_RED}[!]${C_RESET} $*" >&2; }
+warn() { echo "${C_YELLOW}[~]${C_RESET} $*"; }
+ok()   { echo "${C_GREEN}[✓]${C_RESET} $*"; }
+info() { echo "${C_CYAN}[i]${C_RESET} $*"; }
+
+# ---------- 依赖 ----------
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    err "缺少必要命令: $1"
+    exit 1
+  fi
+}
+
+check_python_toml() {
+  python3 - <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli
+    except ImportError:
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+check_deps() {
+  need_cmd git
+  need_cmd python3
+  if ! check_python_toml; then
+    err "Python 缺少 TOML 解析库（tomllib 或 tomli）"
+    info "Python 3.11+ 自带 tomllib；旧版请执行：pip3 install tomli"
+    exit 1
+  fi
+}
+
+# ---------- 路径 ----------
+repo_root() {
+  if [[ -n "${DOTMAN_REPO:-}" ]]; then
+    echo "$DOTMAN_REPO"
+    return 0
+  fi
+  if [[ -f "${DOTMAN_CONFIG_DIR}/${CONFIG_FILE}" ]]; then
+    local rp
+    rp=$(python3 - "${DOTMAN_CONFIG_DIR}/${CONFIG_FILE}" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], "rb") as f:
+    cfg = tomllib.load(f)
+print(cfg.get("repo_path", ""))
+PY
+)
+    if [[ -n "$rp" ]]; then
+      echo "$rp"
+      return 0
+    fi
+  fi
+  echo "${DOTMAN_REPO}"
+}
+
+hostname_from_config() {
+  local repo
+  repo=$(repo_root)
+  local cfg="${repo}/${CONFIG_FILE}"
+  if [[ ! -f "$cfg" ]]; then
+    hostname -s
+    return 0
+  fi
+  python3 - "$cfg" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], "rb") as f:
+    cfg = tomllib.load(f)
+print(cfg.get("hostname", ""))
+PY
+}
+
+current_hostname() {
+  local h
+  h=$(hostname_from_config)
+  if [[ -n "$h" ]]; then
+    echo "$h"
+  else
+    hostname -s
+  fi
+}
+
+# ---------- 路径展开 ----------
+expand_path() {
+  local p="$1"
+  p="${p/#\~/$HOME}"
+  echo "$p"
+}
+
+relative_home() {
+  local p="$1"
+  if [[ "$p" == "$HOME"* ]]; then
+    echo "~${p#$HOME}"
+  else
+    echo "$p"
+  fi
+}
+
+home_relative_path() {
+  local p="$1"
+  if [[ "$p" != "$HOME"* ]]; then
+    echo ""
+    return 0
+  fi
+  local r="${p#$HOME}"
+  echo "${r#/}"
+}
+
+# ---------- TOML 读写 ----------
+toml_ensure_links_file() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    cat > "$path" <<'EOF'
+[links]
+
+EOF
+  fi
+}
+
+toml_add_link() {
+  local file="$1" src="$2" dst="$3"
+  python3 - "$file" "$src" "$dst" <<'PY'
+import sys, os
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+path, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+links = data.setdefault("links", {})
+links[src] = dst
+
+def quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+lines = ["[links]", ""]
+for k, v in links.items():
+    lines.append(f"{quote(k)} = {quote(v)}")
+with open(path, "w") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+}
+
+toml_remove_link() {
+  local file="$1" src="$2"
+  python3 - "$file" "$src" <<'PY'
+import sys, os
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+path, src = sys.argv[1], sys.argv[2]
+if not os.path.exists(path):
+    sys.exit(0)
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+links = data.get("links", {})
+if src not in links:
+    sys.exit(0)
+del links[src]
+
+def quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+lines = ["[links]", ""]
+for k, v in links.items():
+    lines.append(f"{quote(k)} = {quote(v)}")
+with open(path, "w") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+}
+
+load_all_links() {
+  local repo="$1"
+  local host
+  host=$(current_hostname)
+  python3 - "$repo" "$host" <<'PY'
+import sys, os
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+repo, host = sys.argv[1], sys.argv[2]
+result = {}
+for name in [f"links.{host}.toml", "links.common.toml"]:
+    path = os.path.join(repo, name)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        result.update(data.get("links", {}))
+for src, dst in result.items():
+    print(src + "\t" + dst)
+PY
+}
+
+find_src_by_dst() {
+  local repo="$1" host="$2" dst="$3"
+  python3 - "$repo" "$host" "$dst" <<'PY'
+import sys, os
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+repo, host, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+for name in [f"links.{host}.toml", "links.common.toml"]:
+    path = os.path.join(repo, name)
+    if not os.path.exists(path):
+        continue
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    for s, d in data.get("links", {}).items():
+        if d == dst:
+            print(s)
+            sys.exit(0)
+PY
+}
+
+repo_has_git() {
+  local repo
+  repo=$(repo_root)
+  [[ -d "${repo}/.git" ]]
+}
+
+# ---------- Git 操作 ----------
+git_dot() {
+  local repo
+  repo=$(repo_root)
+  git -C "$repo" "$@"
+}
+
+auto_commit_push() {
+  local msg="${1:-dotman update}"
+  if [[ -z "$(git_dot status --porcelain)" ]]; then
+    info "没有改动需要提交"
+    return 0
+  fi
+  git_dot add -A
+  git_dot commit -m "$msg"
+  git_dot push
+}
+
+# ---------- 文件/软链操作 ----------
+backup_item() {
+  local target="$1"
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    return 0
+  fi
+  local backup="${target}$(date +${DATE_FMT})"
+  cp -a "$target" "$backup"
+  ok "已备份到 $backup"
+}
+
+ensure_parent() {
+  local path="$1"
+  local dir
+  dir=$(dirname "$path")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+}
+
+is_symlink() {
+  [[ -L "$1" ]]
+}
+
+symlink_points_to() {
+  local link="$1" target="$2"
+  local real
+  real=$(readlink "$link")
+  [[ "$real" == "$target" ]]
+}
+
+make_link() {
+  local src="$1" dst="$2"
+  ensure_parent "$dst"
+  ln -sfn "$src" "$dst"
+}
+
+# ---------- 仓库初始化 ----------
+ensure_repo_exists() {
+  local auto="${1:-false}"
+  local repo
+  repo=$(repo_root)
+  if [[ -d "${repo}/.git" ]]; then
+    return 0
+  fi
+
+  if [[ "$auto" == "true" ]]; then
+    mkdir -p "$DOTMAN_HOME"
+    git init "$repo" > /dev/null
+    mkdir -p "$DOTMAN_CONFIG_DIR"
+    cat > "${DOTMAN_CONFIG_DIR}/${CONFIG_FILE}" <<EOF
+repo_path = "${repo}"
+EOF
+    local host
+    host=$(hostname -s)
+    cat > "${repo}/${CONFIG_FILE}" <<EOF
+repo_url = ""
+hostname = "${host}"
+EOF
+    toml_ensure_links_file "${repo}/${LINKS_COMMON}"
+    git -C "$repo" add -A
+    git -C "$repo" commit -m "dotman init" > /dev/null 2>&1 || true
+    ok "仓库初始化完成：${repo}"
+    return 0
+  fi
+
+  echo ""
+  warn "未找到 dotman 仓库：${repo}"
+  info "工作目录：${DOTMAN_HOME}"
+  echo ""
+  read -rp "是否立即初始化新仓库？ [Y/n] " answer
+  case "${answer:-Y}" in
+    [yY]|[yY][eE][sS])
+      ensure_repo_exists true
+      ;;
+    *)
+      info "已取消初始化。你可以稍后运行：dotman init <git-url>"
+      exit 0
+      ;;
+  esac
+}
+
+# ---------- ASCII Logo ----------
+print_logo() {
+  echo "${C_BLUE}${C_BOLD}"
+  cat <<'EOF'
+ ____  ____  _____  _      ____  _     
+/  _ \/  _ \/__ __\/ \__/|/  _ \/ \  /|
+| | \|| / \|  / \  | |\/||| / \|| |\ ||
+| |_/|| \_/|  | |  | |  ||| |-||| | \||
+\____/\____/  \_/  \_/  \|\_/ \|\_/  \|
+EOF
+  echo "${C_RESET}"
+  echo "${C_CYAN}自用 dotfiles 管理器${C_RESET} | 版本 ${VERSION}"
+  echo ""
+}
+
+# ---------- 命令实现 ----------
+cmd_init() {
+  local url="${1:-}"
+  if [[ -z "$url" ]]; then
+    err "用法: dotman init <git-url>"
+    exit 1
+  fi
+  local repo
+  repo=$(repo_root)
+
+  mkdir -p "$DOTMAN_HOME"
+
+  if [[ -d "$repo" ]]; then
+    if [[ -d "$repo/.git" ]]; then
+      warn "目录已存在 git 仓库，将使用现有仓库"
+    else
+      err "目录已存在但非 git 仓库: $repo"
+      exit 1
+    fi
+  else
+    git clone "$url" "$repo"
+  fi
+
+  mkdir -p "$DOTMAN_CONFIG_DIR"
+  cat > "${DOTMAN_CONFIG_DIR}/${CONFIG_FILE}" <<EOF
+repo_path = "${repo}"
+EOF
+
+  local host
+  host=$(hostname -s)
+  local cfg="${repo}/${CONFIG_FILE}"
+  if [[ -f "$cfg" ]]; then
+    if ! python3 - "$cfg" <<'PY' "$host"
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+path, host = sys.argv[1], sys.argv[2]
+with open(path, "rb") as f:
+    cfg = tomllib.load(f)
+if not cfg.get("hostname"):
+    exit(1)
+PY
+    then
+      sed -i.bak "s/^hostname[[:space:]]*=.*/hostname = \"${host}\"/" "$cfg"
+      rm -f "${cfg}.bak"
+    fi
+  else
+    cat > "$cfg" <<EOF
+repo_url = "${url}"
+hostname = "${host}"
+EOF
+  fi
+
+  toml_ensure_links_file "${repo}/${LINKS_COMMON}"
+
+  ok "初始化完成：$repo"
+  info "当前设备名：$(current_hostname)"
+}
+
+cmd_pull() {
+  ensure_repo_exists
+  git_dot pull
+  ok "拉取完成"
+}
+
+cmd_push() {
+  ensure_repo_exists
+  local msg="${1:-dotman update}"
+  auto_commit_push "$msg"
+  ok "推送完成"
+}
+
+cmd_add() {
+  ensure_repo_exists
+  local src="${1:-}" dst="${2:-}"
+  if [[ -z "$src" ]]; then
+    err "用法: dotman add <本机路径> [目标软链路径]"
+    exit 1
+  fi
+  src=$(expand_path "$src")
+  if [[ ! -e "$src" && ! -L "$src" ]]; then
+    err "源路径不存在: $src"
+    exit 1
+  fi
+  if [[ -z "$dst" ]]; then
+    dst="$src"
+  else
+    dst=$(expand_path "$dst")
+  fi
+
+  local rel
+  rel=$(home_relative_path "$src")
+  if [[ -z "$rel" ]]; then
+    err "源路径不在 HOME 目录内，请改用：dotman link <仓库内路径> <${src}>"
+    exit 1
+  fi
+
+  local repo
+  repo=$(repo_root)
+  local repo_path="${repo}/${rel}"
+
+  if [[ "$src" == "$repo"* ]]; then
+    err "源路径已经在仓库内，无需 add"
+    exit 1
+  fi
+
+  ensure_parent "$repo_path"
+  if [[ -e "$repo_path" || -L "$repo_path" ]]; then
+    backup_item "$repo_path"
+    rm -rf "$repo_path"
+  fi
+  mv "$src" "$repo_path"
+
+  make_link "$repo_path" "$dst"
+
+  local host
+  host=$(current_hostname)
+  local links_file="${repo}/${LINKS_PREFIX}${host}.toml"
+  toml_ensure_links_file "$links_file"
+  toml_add_link "$links_file" "$rel" "$(relative_home "$dst")"
+
+  auto_commit_push "dotman add $(basename "$src")"
+  ok "已添加并链接：$rel -> $dst"
+}
+
+cmd_remove() {
+  ensure_repo_exists
+  local dst="${1:-}"
+  if [[ -z "$dst" ]]; then
+    err "用法: dotman remove <目标软链路径>"
+    exit 1
+  fi
+  dst=$(expand_path "$dst")
+
+  local repo
+  repo=$(repo_root)
+  local host
+  host=$(current_hostname)
+  local rel_dst
+  rel_dst=$(relative_home "$dst")
+
+  local src
+  src=$(find_src_by_dst "$repo" "$host" "$rel_dst")
+  if [[ -z "$src" ]]; then
+    err "未找到目标链接: $dst"
+    exit 1
+  fi
+
+  local repo_path="${repo}/${src}"
+
+  if is_symlink "$dst"; then
+    rm "$dst"
+  elif [[ -e "$dst" || -L "$dst" ]]; then
+    backup_item "$dst"
+    rm -rf "$dst"
+  fi
+
+  if [[ -e "$repo_path" || -L "$repo_path" ]]; then
+    cp -a "$repo_path" "$dst"
+    rm -rf "$repo_path"
+  fi
+
+  local host_file="${repo}/${LINKS_PREFIX}${host}.toml"
+  local common_file="${repo}/${LINKS_COMMON}"
+  [[ -f "$host_file" ]] && toml_remove_link "$host_file" "$src"
+  [[ -f "$common_file" ]] && toml_remove_link "$common_file" "$src"
+
+  auto_commit_push "dotman remove $rel_dst"
+  ok "已移除：$dst"
+}
+
+cmd_link() {
+  ensure_repo_exists
+  local src="${1:-}" dst="${2:-}"
+  if [[ -z "$src" || -z "$dst" ]]; then
+    err "用法: dotman link <仓库内相对路径> <本机目标路径>"
+    exit 1
+  fi
+
+  local repo
+  repo=$(repo_root)
+  local repo_path="${repo}/${src}"
+  dst=$(expand_path "$dst")
+
+  if [[ ! -e "$repo_path" && ! -L "$repo_path" ]]; then
+    err "仓库内不存在: $repo_path"
+    exit 1
+  fi
+
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    backup_item "$dst"
+    rm -rf "$dst"
+  fi
+  make_link "$repo_path" "$dst"
+
+  local host
+  host=$(current_hostname)
+  local links_file="${repo}/${LINKS_PREFIX}${host}.toml"
+  toml_ensure_links_file "$links_file"
+  toml_add_link "$links_file" "$src" "$(relative_home "$dst")"
+
+  auto_commit_push "dotman link $src"
+  ok "已建立链接：$src -> $dst"
+}
+
+cmd_unlink() {
+  ensure_repo_exists
+  local dst="${1:-}"
+  if [[ -z "$dst" ]]; then
+    err "用法: dotman unlink <本机目标路径>"
+    exit 1
+  fi
+  dst=$(expand_path "$dst")
+
+  if is_symlink "$dst"; then
+    rm "$dst"
+  elif [[ -e "$dst" ]]; then
+    warn "$dst 不是软链，不会删除真实文件"
+  else
+    warn "$dst 不存在"
+  fi
+
+  local repo
+  repo=$(repo_root)
+  local host
+  host=$(current_hostname)
+  local rel_dst
+  rel_dst=$(relative_home "$dst")
+
+  python3 - "$repo" "$host" "$rel_dst" <<'PY'
+import sys, os
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+repo, host, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+for name in [f"links.{host}.toml", "links.common.toml"]:
+    path = os.path.join(repo, name)
+    if not os.path.exists(path):
+        continue
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    links = data.get("links", {})
+    to_remove = [s for s, d in links.items() if d == dst]
+    if not to_remove:
+        continue
+    for s in to_remove:
+        del links[s]
+    lines = ["[links]", ""]
+    for k, v in links.items():
+        lines.append(f"{quote(k)} = {quote(v)}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+PY
+
+  auto_commit_push "dotman unlink $rel_dst"
+  ok "已解除链接：$dst"
+}
+
+cmd_status() {
+  ensure_repo_exists
+  local repo
+  repo=$(repo_root)
+  local host
+  host=$(current_hostname)
+  local total=0 ok_count=0 bad_count=0 missing_count=0
+
+  info "设备名：$host"
+  info "仓库：$repo"
+  echo ""
+
+  while IFS=$'\t' read -r src dst; do
+    [[ -z "$src" ]] && continue
+    total=$((total + 1))
+    local repo_path="${repo}/${src}"
+    local real_dst
+    real_dst=$(expand_path "$dst")
+
+    printf "%-36s -> %s\n" "$src" "$dst"
+
+    if [[ ! -e "$real_dst" && ! -L "$real_dst" ]]; then
+      echo "  ${C_RED}缺失${C_RESET} 目标不存在"
+      missing_count=$((missing_count + 1))
+    elif ! is_symlink "$real_dst"; then
+      echo "  ${C_YELLOW}冲突${C_RESET} 目标存在但不是软链"
+      bad_count=$((bad_count + 1))
+    elif symlink_points_to "$real_dst" "$repo_path"; then
+      echo "  ${C_GREEN}正常${C_RESET}"
+      ok_count=$((ok_count + 1))
+    else
+      local real
+      real=$(readlink "$real_dst")
+      echo "  ${C_YELLOW}指向错误${C_RESET} 当前指向: $real"
+      bad_count=$((bad_count + 1))
+    fi
+  done < <(load_all_links "$repo")
+
+  echo ""
+  info "总计: $total | 正常: $ok_count | 异常: $bad_count | 缺失: $missing_count"
+}
+
+cmd_fix() {
+  ensure_repo_exists
+  local repo
+  repo=$(repo_root)
+  local fixed=0
+
+  while IFS=$'\t' read -r src dst; do
+    [[ -z "$src" ]] && continue
+    local repo_path="${repo}/${src}"
+    local real_dst
+    real_dst=$(expand_path "$dst")
+
+    if is_symlink "$real_dst" && symlink_points_to "$real_dst" "$repo_path"; then
+      continue
+    fi
+
+    if [[ -e "$real_dst" || -L "$real_dst" ]]; then
+      backup_item "$real_dst"
+      rm -rf "$real_dst"
+    fi
+
+    make_link "$repo_path" "$real_dst"
+    ok "已修复：$dst"
+    fixed=$((fixed + 1))
+  done < <(load_all_links "$repo")
+
+  if [[ $fixed -eq 0 ]]; then
+    info "所有链接均正常"
+  else
+    ok "共修复 $fixed 个链接"
+  fi
+}
+
+cmd_doctor() {
+  ensure_repo_exists
+  local repo
+  repo=$(repo_root)
+  info "检查仓库..."
+  git_dot status --short
+
+  info "检查链接..."
+  cmd_status
+
+  info "检查未提交改动..."
+  if [[ -z "$(git_dot status --porcelain)" ]]; then
+    ok "仓库干净"
+  else
+    warn "仓库有未提交改动，可运行 dotman push 提交"
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}dotman ${VERSION}${C_RESET} - 自用 dotfiles 管理脚本
+
+${C_BOLD}用法：${C_RESET}
+  dotman init <git-url>                  从远程仓库初始化
+  dotman pull                           拉取仓库更新
+  dotman push [message]                 提交并推送改动
+  dotman add <src> [dst]                把本机文件移入仓库并建立软链
+  dotman remove <dst>                   移除软链，把文件从仓库拷回本机
+  dotman link <repo-path> <dst>         为仓库中已存在的路径建立软链
+  dotman unlink <dst>                   解除软链（不删除仓库文件）
+  dotman status                         检查所有软链状态
+  dotman fix                            一键修复异常软链
+  dotman doctor                         综合检查
+
+${C_BOLD}环境变量：${C_RESET}
+  DOTMAN_HOME   工作目录，默认 ~/.dotman
+  DOTMAN_REPO   仓库路径，默认 ~/.dotman/dotfiles
+
+EOF
+}
+
+# ---------- 交互式界面 ----------
+interactive_read_path() {
+  local prompt="$1"
+  local value
+  read -rp "$prompt" value
+  echo "$value"
+}
+
+interactive_ensure_repo() {
+  while true; do
+    clear 2>/dev/null || true
+    print_logo
+    warn "仓库尚未初始化"
+    echo ""
+    echo "${C_BOLD}操作菜单：${C_RESET}"
+    echo "  ${C_GREEN}1${C_RESET}. 初始化/克隆远程仓库        dotman init <git-url>"
+    echo "  ${C_GREEN}2${C_RESET}. 创建本地空仓库            dotman init"
+    echo "  ${C_RED}0${C_RESET}. 退出"
+    echo ""
+
+    local choice
+    read -rp "请选择操作 [0-2]: " choice
+    case "$choice" in
+      1)
+        local url
+        url=$(interactive_read_path "请输入 Git 仓库地址: ")
+        if [[ -n "$url" ]]; then
+          cmd_init "$url"
+          return 0
+        fi
+        ;;
+      2)
+        ensure_repo_exists true
+        return 0
+        ;;
+      0|q|quit|exit) exit 0 ;;
+      *) err "无效选择" ;;
+    esac
+    read -rp "按回车键继续..."
+  done
+}
+
+interactive_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    print_logo
+
+    local repo
+    repo=$(repo_root)
+    echo "${C_BOLD}设备：${C_RESET}$(current_hostname)   ${C_BOLD}仓库：${C_RESET}${repo}"
+    echo ""
+    cmd_status 2>/dev/null || true
+
+    echo ""
+    echo "${C_BOLD}操作菜单：${C_RESET}"
+    echo "  ${C_GREEN}1${C_RESET}. 初始化/克隆远程仓库        dotman init <git-url>"
+    echo "  ${C_GREEN}2${C_RESET}. 拉取远程更新               dotman pull"
+    echo "  ${C_GREEN}3${C_RESET}. 推送本地改动               dotman push [message]"
+    echo "  ${C_GREEN}4${C_RESET}. 添加本机文件到仓库         dotman add <src> [dst]"
+    echo "  ${C_GREEN}5${C_RESET}. 移除并恢复文件             dotman remove <dst>"
+    echo "  ${C_GREEN}6${C_RESET}. 建立软链                   dotman link <repo-path> <dst>"
+    echo "  ${C_GREEN}7${C_RESET}. 解除软链                   dotman unlink <dst>"
+    echo "  ${C_GREEN}8${C_RESET}. 检查链接状态               dotman status"
+    echo "  ${C_GREEN}9${C_RESET}. 一键修复链接               dotman fix"
+    echo "  ${C_GREEN}10${C_RESET}. 综合诊断                  dotman doctor"
+    echo "  ${C_RED}0${C_RESET}. 退出"
+    echo ""
+
+    local choice
+    read -rp "请选择操作 [0-10]: " choice
+
+    case "$choice" in
+      1)
+        local url
+        url=$(interactive_read_path "请输入 Git 仓库地址: ")
+        [[ -n "$url" ]] && cmd_init "$url" ;;
+      2) cmd_pull ;;
+      3)
+        local msg
+        msg=$(interactive_read_path "请输入提交消息（直接回车使用默认）: ")
+        [[ -n "$msg" ]] && cmd_push "$msg" || cmd_push ;;
+      4)
+        local src dst
+        src=$(interactive_read_path "请输入要添加的本机路径: ")
+        dst=$(interactive_read_path "请输入目标软链路径（直接回车与源路径相同）: ")
+        if [[ -n "$src" ]]; then
+          [[ -n "$dst" ]] && cmd_add "$src" "$dst" || cmd_add "$src"
+        fi ;;
+      5)
+        local dst
+        dst=$(interactive_read_path "请输入要移除的目标软链路径: ")
+        [[ -n "$dst" ]] && cmd_remove "$dst" ;;
+      6)
+        local src dst
+        src=$(interactive_read_path "请输入仓库内相对路径: ")
+        dst=$(interactive_read_path "请输入本机目标路径: ")
+        [[ -n "$src" && -n "$dst" ]] && cmd_link "$src" "$dst" ;;
+      7)
+        local dst
+        dst=$(interactive_read_path "请输入要解除软链的路径: ")
+        [[ -n "$dst" ]] && cmd_unlink "$dst" ;;
+      8) cmd_status ;;
+      9) cmd_fix ;;
+      10) cmd_doctor ;;
+      0|q|quit|exit) exit 0 ;;
+      *) err "无效选择，请重新输入" ;;
+    esac
+
+    echo ""
+    read -rp "按回车键继续..."
+  done
+}
+
+# ---------- 入口 ----------
+main() {
+  check_deps
+
+  if [[ $# -eq 0 ]]; then
+    if repo_has_git; then
+      interactive_menu
+    else
+      interactive_ensure_repo
+      interactive_menu
+    fi
+    return 0
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    init)    cmd_init "$@" ;;
+    pull)    cmd_pull ;;
+    push)    cmd_push "$@" ;;
+    add)     cmd_add "$@" ;;
+    remove)  cmd_remove "$@" ;;
+    link)    cmd_link "$@" ;;
+    unlink)  cmd_unlink "$@" ;;
+    status)  cmd_status ;;
+    fix)     cmd_fix ;;
+    doctor)  cmd_doctor ;;
+    help|--help|-h) cmd_help ;;
+    *)       err "未知命令: $cmd"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
