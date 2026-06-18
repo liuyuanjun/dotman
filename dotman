@@ -474,6 +474,118 @@ is_managed_by_dotman() {
   [[ -n "$(ini_find_src_by_dst "$repo" "$host" "$rel_path")" ]]
 }
 
+is_binary_file() {
+  local path="$1"
+  local name
+  name=$(basename "$path")
+
+  # 按后缀快速判断常见二进制/数据文件
+  case "$name" in
+    *.db|*.sqlite|*.sqlite3|*.bak|*.zip|*.gz|*.tar|*.tgz|*.bz2|\
+    *.7z|*.rar|*.jpg|*.jpeg|*.png|*.gif|*.bmp|*.webp|*.svgz|\
+    *.mp3|*.mp4|*.avi|*.mov|*.mkv|*.wav|*.flac|*.ogg|\
+    *.pdf|*.doc|*.docx|*.xls|*.xlsx|*.ppt|*.pptx|\
+    *.exe|*.dll|*.so|*.dylib|*.bin|*.dat|*.dmg|*.pkg|\
+    *.pyc|*.pyo|*.class|*.o|*.a|*.obj)
+      return 0 ;;
+  esac
+
+  if [[ ! -f "$path" ]]; then
+    return 1
+  fi
+
+  # 优先使用 file 命令
+  if command -v file >/dev/null 2>&1; then
+    local enc
+    enc=$(file --mime-encoding -b "$path" 2>/dev/null || true)
+    if [[ "$enc" == "binary" ]]; then
+      return 0
+    fi
+  fi
+
+  # 兜底：grep -I 能匹配到可打印字符就不是二进制
+  if grep -qI . "$path" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+is_log_file() {
+  local path="$1"
+  local name
+  name=$(basename "$path")
+  case "$name" in
+    *.log)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# 返回文件类型标签：binary / log / text / 含二进制 / 目录
+file_type_label() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    if [[ -n "$(scan_binary_files "$path")" ]]; then
+      echo "含二进制"
+    else
+      echo "目录"
+    fi
+    return 0
+  fi
+  if is_binary_file "$path"; then
+    echo "二进制"
+  elif is_log_file "$path"; then
+    echo "日志"
+  else
+    echo "文本"
+  fi
+}
+
+scan_binary_files() {
+  local target="$1"
+  if [[ -f "$target" ]]; then
+    if is_binary_file "$target" || is_log_file "$target"; then
+      echo "$target"
+    fi
+    return 0
+  fi
+  if [[ ! -d "$target" ]]; then
+    return 0
+  fi
+
+  local count=0
+  local file
+  while IFS= read -r -d '' file; do
+    if is_binary_file "$file" || is_log_file "$file"; then
+      echo "$file"
+      count=$((count + 1))
+      if [[ $count -ge 1000 ]]; then
+        warn "扫描到超过 1000 个二进制/日志文件，停止扫描"
+        break
+      fi
+    fi
+  done < <(find "$target" -type f ! -name ".*" -print0 2>/dev/null || true)
+}
+
+# 将规则写入仓库根目录 .gitignore，避免重复
+add_to_gitignore() {
+  local pattern="$1"
+  local repo
+  repo=$(repo_root)
+  local gitignore="${repo}/.gitignore"
+
+  if [[ -f "$gitignore" ]] && grep -qxF "$pattern" "$gitignore" 2>/dev/null; then
+    return 0
+  fi
+
+  ensure_parent "$gitignore"
+  if [[ -f "$gitignore" ]] && [[ -s "$gitignore" ]]; then
+    echo "" >> "$gitignore"
+  fi
+  echo "$pattern" >> "$gitignore"
+  ok "已添加到 .gitignore：$pattern"
+}
+
 fix_link_permissions() {
   local src="$1" dst="$2"
   local name
@@ -731,9 +843,16 @@ add_one_item() {
   return 0
 }
 
-interactive_add_ssh_directory() {
-  local ssh_dir="$1"
-  warn ".ssh 目录中包含私钥文件，无法按目录添加。"
+interactive_add_directory() {
+  local dir="$1"
+  local is_ssh=false
+  if [[ "$(basename "$dir")" == ".ssh" ]]; then
+    is_ssh=true
+    warn ".ssh 目录中包含私钥文件，无法按目录添加。"
+  else
+    warn "检测到 $(basename "$dir") 目录中包含二进制/日志/数据文件，不适合整体添加。"
+  fi
+
   local answer
   read -rp "是否改为逐个文件添加？ [Y/n] " answer
   case "${answer:-Y}" in
@@ -746,9 +865,10 @@ interactive_add_ssh_directory() {
 
   local items=()
   local managed_flags=()
+  local type_labels=()
   local item
   while IFS= read -r -d '' item; do
-    if is_ssh_private_key "$item"; then
+    if [[ "$is_ssh" == "true" ]] && is_ssh_private_key "$item"; then
       continue
     fi
     items+=("$item")
@@ -757,31 +877,59 @@ interactive_add_ssh_directory() {
     else
       managed_flags+=("0")
     fi
-  done < <(find "$ssh_dir" -mindepth 1 -maxdepth 1 ! -name ".*" -print0 | sort -z)
+    if [[ "$is_ssh" == "true" ]]; then
+      type_labels+=("文本")
+    else
+      type_labels+=("$(file_type_label "$item")")
+    fi
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 ! -name ".*" -print0 | sort -z)
 
   local total=${#items[@]}
   if [[ $total -eq 0 ]]; then
-    info ".ssh 中没有可添加的安全文件（私钥已过滤）"
+    info "目录中没有可添加的文件"
     return 0
   fi
 
   echo ""
-  info ".ssh 中的安全文件如下（私钥已过滤）："
+  if [[ "$is_ssh" == "true" ]]; then
+    info ".ssh 中的安全文件如下（私钥已过滤）："
+  else
+    info "目录中的文件如下（二进制/日志已标注）："
+  fi
   echo ""
+
   local i
   for ((i=0; i<total; i++)); do
     local name
     name=$(basename "${items[$i]}")
+    local managed_label
+    local type_label="${type_labels[$i]}"
+    local type_color="${C_CYAN}"
+    local not_recommended=""
+
     if [[ "${managed_flags[$i]}" == "1" ]]; then
-      printf "  %s%2d.%s ${C_GREEN}[已添加]%s   %s\n" "${C_BOLD}" "$((i+1))" "${C_RESET}" "${C_RESET}" "$name"
+      managed_label="${C_GREEN}[已添加]${C_RESET}"
     else
-      printf "  %s%2d.%s ${C_CYAN}[未添加]%s   %s\n" "${C_BOLD}" "$((i+1))" "${C_RESET}" "${C_RESET}" "$name"
+      managed_label="${C_CYAN}[未添加]${C_RESET}"
     fi
+
+    if [[ "$type_label" == "二进制" || "$type_label" == "含二进制" ]]; then
+      type_color="${C_RED}"
+      not_recommended=" ${C_YELLOW}(不建议)${C_RESET}"
+    elif [[ "$type_label" == "日志" ]]; then
+      type_color="${C_YELLOW}"
+      not_recommended=" ${C_YELLOW}(不建议)${C_RESET}"
+    fi
+
+    printf "  %s%2d.%s %s %s%-6s%s   %s%s\n" \
+      "${C_BOLD}" "$((i+1))" "${C_RESET}" \
+      "$managed_label" "$type_color" "[$type_label]" "${C_RESET}" \
+      "$name" "$not_recommended"
   done
   echo ""
 
   local selection
-  read -rp "请输入要添加的序号（逗号分隔，a 添加全部未添加项，回车取消）: " selection
+  read -rp "请输入要添加的序号（逗号分隔，a 添加全部推荐项，回车取消）: " selection
   selection=$(echo "$selection" | tr -d ' ')
   if [[ -z "$selection" || "$selection" == "q" ]]; then
     info "已取消"
@@ -791,7 +939,7 @@ interactive_add_ssh_directory() {
   local -a selected=()
   if [[ "$selection" == "a" ]]; then
     for ((i=0; i<total; i++)); do
-      if [[ "${managed_flags[$i]}" == "0" ]]; then
+      if [[ "${managed_flags[$i]}" == "0" ]] && [[ "${type_labels[$i]}" == "文本" || "${type_labels[$i]}" == "目录" ]]; then
         selected+=("${items[$i]}")
       fi
     done
@@ -818,6 +966,27 @@ interactive_add_ssh_directory() {
     return 0
   fi
 
+  # 对未选中且未管理的二进制/日志文件，询问是否加入 .gitignore
+  local ignored_count=0
+  if [[ "$is_ssh" != "true" ]]; then
+    for ((i=0; i<total; i++)); do
+      local found=false
+      local sel
+      for sel in "${selected[@]}"; do
+        if [[ "$sel" == "${items[$i]}" ]]; then
+          found=true
+          break
+        fi
+      done
+      if [[ "$found" == "false" ]] && [[ "${managed_flags[$i]}" == "0" ]] && [[ "${type_labels[$i]}" != "文本" && "${type_labels[$i]}" != "目录" ]]; then
+        local rel_pattern
+        rel_pattern=$(home_relative_path "${items[$i]}")
+        add_to_gitignore "$rel_pattern"
+        ignored_count=$((ignored_count + 1))
+      fi
+    done
+  fi
+
   local success=0
   local item_path
   for item_path in "${selected[@]}"; do
@@ -828,8 +997,12 @@ interactive_add_ssh_directory() {
     fi
   done
 
+  if [[ $ignored_count -gt 0 ]]; then
+    warn "已自动忽略 ${ignored_count} 个二进制/日志文件"
+  fi
+
   if [[ $success -gt 0 ]]; then
-    auto_commit_push "dotman add batch from .ssh (${success} items)"
+    auto_commit_push "dotman add batch from $(basename "$dir") (${success} items)"
     ok "共提交 ${success} 个文件"
   else
     info "没有成功添加的文件"
@@ -858,7 +1031,7 @@ cmd_add() {
   # .ssh 目录特殊处理
   if [[ "$(basename "$src")" == ".ssh" && -d "$src" ]]; then
     if [[ -t 0 ]]; then
-      interactive_add_ssh_directory "$src"
+      interactive_add_directory "$src"
       return 0
     else
       err "不建议将整个 ~/.ssh 目录加入 dotman 管理"
@@ -873,6 +1046,54 @@ cmd_add() {
       info "  dotman add ~/.ssh/id_ed25519.pub"
       info "私钥请使用密码管理器、加密存储或手动安全复制同步"
       exit 1
+    fi
+  fi
+
+  # 二进制/日志文件检测
+  if [[ -f "$src" ]]; then
+    if is_binary_file "$src" || is_log_file "$src"; then
+      local kind
+      if is_binary_file "$src"; then
+        kind="二进制文件"
+      else
+        kind="日志文件"
+      fi
+      warn "检测到 $(basename "$src") 是${kind}，不适合纳入 Git 管理。"
+      info "此类文件在多设备同步时容易产生冲突，建议加入 .gitignore。"
+      if [[ -t 0 ]]; then
+        local answer
+        read -rp "是否加入 .gitignore 并跳过添加？ [Y/n] " answer
+        case "${answer:-Y}" in
+          [yY]|[yY][eE][sS])
+            add_to_gitignore "$(home_relative_path "$src")"
+            return 0
+            ;;
+          *)
+            warn "继续添加${kind}，如后续出现冲突请手动处理"
+            ;;
+        esac
+      else
+        err "非交互模式下不自动添加${kind}，如需添加请先用 dotman add 逐个处理"
+        exit 1
+      fi
+    fi
+  elif [[ -d "$src" ]]; then
+    local binaries
+    binaries=$(scan_binary_files "$src")
+    if [[ -n "$binaries" ]]; then
+      warn "检测到 $(basename "$src") 目录中包含二进制/日志/数据文件："
+      local b
+      while IFS= read -r b; do
+        info "  $(relative_home "$b" 2>/dev/null || echo "$b")"
+      done <<< "$binaries"
+      info "此类文件不适合整体纳入 Git 管理，可能在多设备同步时产生冲突。"
+      if [[ -t 0 ]]; then
+        interactive_add_directory "$src"
+        return 0
+      else
+        err "非交互模式下无法整体添加包含二进制文件的目录，请逐个添加文本文件"
+        exit 1
+      fi
     fi
   fi
 
