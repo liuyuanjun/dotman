@@ -73,6 +73,34 @@ repo_url = "https://github.com/yourname/dotfiles.git"
 
 ---
 
+## 安装
+
+通过 `curl` 从 GitHub 仓库下载 `dotman` 脚本并赋予可执行权限：
+
+```bash
+mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/liuyuanjun/dotman/main/dotman -o ~/bin/dotman && chmod +x ~/bin/dotman
+```
+
+下载完成后，确保 `~/bin` 在你的 `PATH` 中。如果尚未添加，可在 shell 配置文件中写入：
+
+```bash
+export PATH="$HOME/bin:$PATH"
+```
+
+然后重新加载配置（以 `~/.zshrc` 为例）：
+
+```bash
+source ~/.zshrc
+```
+
+验证安装：
+
+```bash
+command -v dotman && dotman
+```
+
+---
+
 ## 快速开始
 
 ### 方式一：直接运行（推荐）
