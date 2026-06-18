@@ -187,6 +187,20 @@ dotman add ~/my-theme.zsh-theme ~/.oh-my-zsh/custom/themes/my-theme.zsh-theme
 2. 保留仓库版本，备份本地版本并创建软链
 3. 取消
 
+**关于 `~/.ssh`**：
+不建议用 `dotman add ~/.ssh` 管理整个 `.ssh` 目录。Git 不保留 600 权限，私钥 checkout 后会变成 644，导致 SSH 拒绝连接；同时私钥以明文进入 Git 历史也存在安全风险。
+
+推荐单独添加安全文件：
+
+```bash
+dotman add ~/.ssh/config
+dotman add ~/.ssh/known_hosts
+dotman add ~/.ssh/authorized_keys
+dotman add ~/.ssh/id_ed25519.pub
+```
+
+私钥（如 `id_ed25519`、`id_rsa`）会被 dotman 自动拒绝，请使用密码管理器、加密存储或手动安全复制同步。
+
 ---
 
 ## 命令参考

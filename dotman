@@ -430,6 +430,84 @@ make_link() {
   local src="$1" dst="$2"
   ensure_parent "$dst"
   ln -sfn "$src" "$dst"
+  fix_link_permissions "$src" "$dst"
+}
+
+is_ssh_private_key() {
+  local path="$1"
+  local name
+  name=$(basename "$path")
+  case "$name" in
+    id_ed25519|id_rsa|id_ecdsa|id_dsa|id_ed25519_sk|id_ecdsa_sk)
+      return 0 ;;
+  esac
+  if [[ -f "$path" ]]; then
+    local first
+    first=$(head -n 1 "$path" 2>/dev/null || true)
+    if [[ "$first" == "-----BEGIN OPENSSH PRIVATE KEY-----" ]] || \
+       [[ "$first" =~ ^-----BEGIN\ .*PRIVATE\ KEY-----$ ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+is_safe_ssh_file() {
+  local path="$1"
+  local name
+  name=$(basename "$path")
+  case "$name" in
+    *.pub|config|known_hosts|authorized_keys)
+      return 0 ;;
+  esac
+  return 1
+}
+
+fix_link_permissions() {
+  local src="$1" dst="$2"
+  local name
+  name=$(basename "$src")
+
+  case "$name" in
+    id_ed25519|id_rsa|id_ecdsa|id_dsa|id_ed25519_sk|id_ecdsa_sk|*.pem|*.key)
+      if [[ -e "$dst" ]]; then
+        chmod 600 "$dst" 2>/dev/null || true
+      fi
+      ;;
+    config)
+      if [[ -e "$dst" ]] && [[ "$(basename "$(dirname "$dst")")" == ".ssh" ]]; then
+        chmod 600 "$dst" 2>/dev/null || true
+      fi
+      ;;
+    known_hosts|authorized_keys|*.pub)
+      if [[ -e "$dst" ]]; then
+        chmod 644 "$dst" 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+remove_sockets_from_backup() {
+  local backup="$1"
+  if [[ ! -d "$backup" ]]; then
+    return 0
+  fi
+  local socket
+  while IFS= read -r -d '' socket; do
+    rm -f "$socket"
+    warn "备份中跳过 Unix socket: $(relative_home "$socket" 2>/dev/null || echo "$socket")"
+  done < <(find "$backup" -type s -print0 2>/dev/null || true)
+}
+
+backup_item() {
+  local target="$1"
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    return 0
+  fi
+  local backup="${target}$(date +${DATE_FMT})"
+  cp -a "$target" "$backup"
+  remove_sockets_from_backup "$backup"
+  ok "已备份到 $backup"
 }
 
 # ---------- 仓库初始化 ----------
@@ -574,6 +652,37 @@ cmd_add() {
     info "如需重新建立链接，请用：dotman link <仓库内路径> <${src}>"
     exit 1
   fi
+
+  # 敏感文件保护
+  if [[ "$(basename "$src")" == ".ssh" && -d "$src" ]]; then
+    err "不建议将整个 ~/.ssh 目录加入 dotman 管理"
+    info "原因："
+    info "  1. Git 不保留 600 权限，私钥 checkout 后会变成 644，导致 SSH 拒绝连接"
+    info "  2. 私钥以明文形式进入 Git 历史，存在安全风险"
+    info "  3. .ssh 目录包含 agent socket、临时文件，不适合整体同步"
+    info "建议单独添加安全文件："
+    info "  dotman add ~/.ssh/config"
+    info "  dotman add ~/.ssh/known_hosts"
+    info "  dotman add ~/.ssh/authorized_keys"
+    info "  dotman add ~/.ssh/id_ed25519.pub"
+    info "私钥请使用密码管理器、加密存储或手动安全复制同步"
+    exit 1
+  fi
+
+  if is_ssh_private_key "$src"; then
+    err "检测到 SSH 私钥，拒绝加入仓库: $src"
+    info "Git 无法保留 600 权限，checkout 后权限会变松，导致 SSH 无法使用"
+    info "私钥也不应明文存入 Git 历史"
+    info "如需同步，请使用密码管理器、加密存储或手动安全复制"
+    exit 1
+  fi
+
+  if [[ "$src" == "$HOME/.ssh/"* ]] && ! is_safe_ssh_file "$src"; then
+    warn "该文件位于 ~/.ssh 目录且不属于推荐同步的安全文件类型"
+    info "推荐同步：config、known_hosts、authorized_keys、*.pub"
+    info "请确认你确实希望将其加入仓库"
+  fi
+
   if [[ -z "$dst" ]]; then
     dst="$src"
   else
@@ -807,6 +916,7 @@ cmd_fix() {
     real_dst=$(expand_path "$dst")
 
     if is_symlink "$real_dst" && symlink_points_to "$real_dst" "$repo_path"; then
+      fix_link_permissions "$repo_path" "$real_dst"
       continue
     fi
 
