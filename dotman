@@ -463,6 +463,17 @@ is_safe_ssh_file() {
   return 1
 }
 
+is_managed_by_dotman() {
+  local path="$1"
+  local repo
+  repo=$(repo_root)
+  local host
+  host=$(current_hostname)
+  local rel_path
+  rel_path=$(relative_home "$path")
+  [[ -n "$(ini_find_src_by_dst "$repo" "$host" "$rel_path")" ]]
+}
+
 fix_link_permissions() {
   local src="$1" dst="$2"
   local name
@@ -634,47 +645,17 @@ cmd_push() {
   ok "推送完成"
 }
 
-cmd_add() {
-  ensure_repo_exists
-  local src="${1:-}" dst="${2:-}"
-  if [[ -z "$src" ]]; then
-    err "用法: dotman add <本机路径> [目标软链路径]"
-    exit 1
-  fi
-  src=$(expand_path "$src")
-  if [[ ! -e "$src" && ! -L "$src" ]]; then
-    err "源路径不存在: $src"
-    exit 1
-  fi
-  if is_symlink "$src"; then
-    err "源路径已是软链，无需 add: $src"
-    info "如需更新内容，请直接编辑该软链指向的仓库文件"
-    info "如需重新建立链接，请用：dotman link <仓库内路径> <${src}>"
-    exit 1
-  fi
-
-  # 敏感文件保护
-  if [[ "$(basename "$src")" == ".ssh" && -d "$src" ]]; then
-    err "不建议将整个 ~/.ssh 目录加入 dotman 管理"
-    info "原因："
-    info "  1. Git 不保留 600 权限，私钥 checkout 后会变成 644，导致 SSH 拒绝连接"
-    info "  2. 私钥以明文形式进入 Git 历史，存在安全风险"
-    info "  3. .ssh 目录包含 agent socket、临时文件，不适合整体同步"
-    info "建议单独添加安全文件："
-    info "  dotman add ~/.ssh/config"
-    info "  dotman add ~/.ssh/known_hosts"
-    info "  dotman add ~/.ssh/authorized_keys"
-    info "  dotman add ~/.ssh/id_ed25519.pub"
-    info "私钥请使用密码管理器、加密存储或手动安全复制同步"
-    exit 1
-  fi
+# 单个文件/目录添加的核心逻辑（不提交）
+# 成功返回 0，失败返回 1
+add_one_item() {
+  local src="$1" dst="${2:-}"
 
   if is_ssh_private_key "$src"; then
     err "检测到 SSH 私钥，拒绝加入仓库: $src"
     info "Git 无法保留 600 权限，checkout 后权限会变松，导致 SSH 无法使用"
     info "私钥也不应明文存入 Git 历史"
     info "如需同步，请使用密码管理器、加密存储或手动安全复制"
-    exit 1
+    return 1
   fi
 
   if [[ "$src" == "$HOME/.ssh/"* ]] && ! is_safe_ssh_file "$src"; then
@@ -693,7 +674,7 @@ cmd_add() {
   rel=$(home_relative_path "$src")
   if [[ -z "$rel" ]]; then
     err "源路径不在 HOME 目录内，请改用：dotman link <仓库内路径> <${src}>"
-    exit 1
+    return 1
   fi
 
   local repo
@@ -702,7 +683,7 @@ cmd_add() {
 
   if [[ "$src" == "$repo" || "$src" == "$repo/"* ]]; then
     err "源路径已经在仓库内，无需 add"
-    exit 1
+    return 1
   fi
 
   ensure_parent "$repo_path"
@@ -726,7 +707,7 @@ cmd_add() {
           ;;
         3|*)
           info "已取消"
-          exit 0
+          return 1
           ;;
       esac
     else
@@ -746,8 +727,158 @@ cmd_add() {
   local links_file="${repo}/${LINKS_PREFIX}${host}.conf"
   ini_add_link "$links_file" "$rel" "$(relative_home "$dst")"
 
-  auto_commit_push "dotman add $(basename "$src")"
   ok "已添加并链接：$rel -> $dst"
+  return 0
+}
+
+interactive_add_ssh_directory() {
+  local ssh_dir="$1"
+  warn ".ssh 目录中包含私钥文件，无法按目录添加。"
+  local answer
+  read -rp "是否改为逐个文件添加？ [Y/n] " answer
+  case "${answer:-Y}" in
+    [yY]|[yY][eE][sS]) ;;
+    *)
+      info "已取消"
+      return 0
+      ;;
+  esac
+
+  local items=()
+  local managed_flags=()
+  local item
+  while IFS= read -r -d '' item; do
+    if is_ssh_private_key "$item"; then
+      continue
+    fi
+    items+=("$item")
+    if is_managed_by_dotman "$item"; then
+      managed_flags+=("1")
+    else
+      managed_flags+=("0")
+    fi
+  done < <(find "$ssh_dir" -mindepth 1 -maxdepth 1 ! -name ".*" -print0 | sort -z)
+
+  local total=${#items[@]}
+  if [[ $total -eq 0 ]]; then
+    info ".ssh 中没有可添加的安全文件（私钥已过滤）"
+    return 0
+  fi
+
+  echo ""
+  info ".ssh 中的安全文件如下（私钥已过滤）："
+  echo ""
+  local i
+  for ((i=0; i<total; i++)); do
+    local name
+    name=$(basename "${items[$i]}")
+    if [[ "${managed_flags[$i]}" == "1" ]]; then
+      printf "  %s%2d.%s ${C_GREEN}[已添加]%s   %s\n" "${C_BOLD}" "$((i+1))" "${C_RESET}" "${C_RESET}" "$name"
+    else
+      printf "  %s%2d.%s ${C_CYAN}[未添加]%s   %s\n" "${C_BOLD}" "$((i+1))" "${C_RESET}" "${C_RESET}" "$name"
+    fi
+  done
+  echo ""
+
+  local selection
+  read -rp "请输入要添加的序号（逗号分隔，a 添加全部未添加项，回车取消）: " selection
+  selection=$(echo "$selection" | tr -d ' ')
+  if [[ -z "$selection" || "$selection" == "q" ]]; then
+    info "已取消"
+    return 0
+  fi
+
+  local -a selected=()
+  if [[ "$selection" == "a" ]]; then
+    for ((i=0; i<total; i++)); do
+      if [[ "${managed_flags[$i]}" == "0" ]]; then
+        selected+=("${items[$i]}")
+      fi
+    done
+  else
+    local -a nums
+    IFS=',' read -ra nums <<< "$selection"
+    local n
+    for n in "${nums[@]}"; do
+      if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= total )); then
+        local idx=$((n-1))
+        if [[ "${managed_flags[$idx]}" == "1" ]]; then
+          warn "已跳过已添加项：$(basename "${items[$idx]}")"
+        else
+          selected+=("${items[$idx]}")
+        fi
+      else
+        warn "无效序号，已忽略: $n"
+      fi
+    done
+  fi
+
+  if [[ ${#selected[@]} -eq 0 ]]; then
+    info "没有选中新文件，无需处理"
+    return 0
+  fi
+
+  local success=0
+  local item_path
+  for item_path in "${selected[@]}"; do
+    if add_one_item "$item_path"; then
+      success=$((success + 1))
+    else
+      warn "添加失败：$item_path"
+    fi
+  done
+
+  if [[ $success -gt 0 ]]; then
+    auto_commit_push "dotman add batch from .ssh (${success} items)"
+    ok "共提交 ${success} 个文件"
+  else
+    info "没有成功添加的文件"
+  fi
+}
+
+cmd_add() {
+  ensure_repo_exists
+  local src="${1:-}" dst="${2:-}"
+  if [[ -z "$src" ]]; then
+    err "用法: dotman add <本机路径> [目标软链路径]"
+    exit 1
+  fi
+  src=$(expand_path "$src")
+  if [[ ! -e "$src" && ! -L "$src" ]]; then
+    err "源路径不存在: $src"
+    exit 1
+  fi
+  if is_symlink "$src"; then
+    err "源路径已是软链，无需 add: $src"
+    info "如需更新内容，请直接编辑该软链指向的仓库文件"
+    info "如需重新建立链接，请用：dotman link <仓库内路径> <${src}>"
+    exit 1
+  fi
+
+  # .ssh 目录特殊处理
+  if [[ "$(basename "$src")" == ".ssh" && -d "$src" ]]; then
+    if [[ -t 0 ]]; then
+      interactive_add_ssh_directory "$src"
+      return 0
+    else
+      err "不建议将整个 ~/.ssh 目录加入 dotman 管理"
+      info "原因："
+      info "  1. Git 不保留 600 权限，私钥 checkout 后会变成 644，导致 SSH 拒绝连接"
+      info "  2. 私钥以明文形式进入 Git 历史，存在安全风险"
+      info "  3. .ssh 目录包含 agent socket、临时文件，不适合整体同步"
+      info "建议单独添加安全文件："
+      info "  dotman add ~/.ssh/config"
+      info "  dotman add ~/.ssh/known_hosts"
+      info "  dotman add ~/.ssh/authorized_keys"
+      info "  dotman add ~/.ssh/id_ed25519.pub"
+      info "私钥请使用密码管理器、加密存储或手动安全复制同步"
+      exit 1
+    fi
+  fi
+
+  if add_one_item "$src" "$dst"; then
+    auto_commit_push "dotman add $(basename "$src")"
+  fi
 }
 
 cmd_remove() {
